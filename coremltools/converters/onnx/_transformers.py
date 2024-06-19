@@ -823,9 +823,22 @@ class ConstantRemover(object):
                 transformation_performed = True
             elif node.op_type == "Slice":
                 x = node.input_tensors[node.inputs[0]]
-                ends = node.attrs["ends"]
-                starts = node.attrs["starts"]
-                axes = node.attrs.get("axes", range(len(starts)))
+                # print(dir(node))
+                # print(node.name)
+                # print(x)
+                # for i, ip in enumerate(node.inputs):
+                #     print(f'  {i} {ip}: {node.input_tensors[ip]}')
+                # print(list(node.attrs.keys()))
+                if 'ends' in node.attrs:
+                    ends = node.attrs["ends"]
+                    starts = node.attrs["starts"]
+                    axes = node.attrs.get("axes", range(len(starts)))
+                elif len(node.inputs) == 4:
+                    ends = node.input_tensors[node.inputs[1]]
+                    starts = node.input_tensors[node.inputs[2]]
+                    axes = node.input_tensors[node.inputs[3]]
+                else:
+                    raise RuntimeError("Couldn't process slice op")
                 output = x
                 for i, a in enumerate(axes):
                     s = starts[i]
@@ -852,10 +865,13 @@ class ConstantRemover(object):
             elif node.op_type == "Unsqueeze" or node.op_type == "Squeeze":
                 x = node.input_tensors[node.inputs[0]]
                 if node.op_type == "Unsqueeze":
-                    axes = node.attrs["axes"]
-                    axes.sort()
-                    for axis in axes:
-                        output = np.expand_dims(x, axis=axis)  # type: ignore
+                    axes = node.attrs.get("axes", None)
+                    if axes is not None:
+                        axes.sort()
+                        for axis in axes:
+                            output = np.expand_dims(x, axis=axis)  # type: ignore
+                    else:
+                        output = np.expand_dims(x, axis=0)
                 else:
                     axes = node.attrs.get("axes", None)
                     output = np.squeeze(x, axis=tuple(axes))

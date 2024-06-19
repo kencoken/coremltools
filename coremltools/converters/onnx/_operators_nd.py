@@ -568,10 +568,10 @@ def _convert_constant_of_shape(builder, node, graph, err):
     # if shape is known, create tensor of given shape
     # otherwise create tensor at runtime
     if node.inputs[0] in node.input_tensors:
-        output_shape = node.input_tensors[node.inputs[0]]
+        output_shape = node.input_tensors[node.inputs[0]].astype(int)
         # add_fill_static requires shape to be more than rank-1
-        if len(output_shape.shape) == 1:
-            output_shape = output_shape.reshape(output_shape.shape[0], 1)
+        # if len(output_shape.shape) == 1:
+        #     output_shape = output_shape.reshape(output_shape.shape[0], 1)
         builder.add_fill_static(
             name=node.name,
             output_name=node.outputs[0],
@@ -1609,9 +1609,13 @@ def _convert_pad(builder, node, graph, err):
         pads_coreml[::2] = pads[:len(pads) // 2]
         pads_coreml[1::2] = pads[len(pads) // 2:]
 
+        # for some reason this filtering is necessary
+        input_names = [input_name for input_name in node.inputs if input_name != '']
+        assert(len(input_names) == 2)
+
         builder.add_constant_pad(
             name=node.name,
-            input_names=node.inputs,
+            input_names=input_names,
             output_name=node.outputs[0],
             value=value,
             pad_to_given_output_size_mode=False,
@@ -2297,11 +2301,14 @@ def _convert_slice(builder, node, graph, err):
     https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#L5082
     """
     if len(node.inputs) == 1:
+        # print('**  Branching to len(node.inputs) == 1')
         return _convert_slice_ir4v9(builder, node, graph, err)
 
+    # print('**  Branching to len(node.inputs) > 1')
+    # print(f'    Look for {node.inputs[0]} in {node.name}')
     if node.inputs[0] not in graph.shape_dict:
         err.unsupported_op_configuration(
-            builder, node, graph, "Input shape not available"
+            builder, node, graph, f"Input shape not available for {node.inputs[0]}"
         )
 
     data_shape = graph.shape_dict[node.inputs[0]]
@@ -2312,16 +2319,43 @@ def _convert_slice(builder, node, graph, err):
     default_axes = list(range(len_of_data))
 
     add_static_slice_layer = False
-    if node.inputs[1] in node.input_tensors and node.inputs[2] in node.input_tensors:
-        if len(node.inputs) > 3:
-            if node.inputs[3] in node.input_tensors:
-                if len(node.inputs) > 4:
-                    if node.inputs[4] in node.input_tensors:
-                        add_static_slice_layer = True
-                else:
-                    add_static_slice_layer = True
-        else:
-            add_static_slice_layer = True
+    # print(f'node.inputs: {node.inputs}')
+    # print(f'node.input_tensors.keys(): {list(node.input_tensors.keys())}')
+    # print(f'node.parents: {node.parents}')
+    # if len(node.parents) > 0:
+    #     print(f'node.parents[0].name: {node.parents[0].name}')
+    #     print(f'node.parents[0].outputs: {node.parents[0].outputs}')
+    #     print(dir(node.parents[0]))
+    # for i in range(1, len(node.inputs)):
+    #     print(f'[{i}] {node.inputs[i]} {node.inputs[i] in node.input_tensors}')
+
+    # if node.inputs[1] in node.input_tensors and node.inputs[2] in node.input_tensors:
+    #     if len(node.inputs) > 3:
+    #         if node.inputs[3] in node.input_tensors:
+    #             if len(node.inputs) > 4:
+    #                 if node.inputs[4] in node.input_tensors:
+    #                     add_static_slice_layer = True
+    #             else:
+    #                 add_static_slice_layer = True
+    #     else:
+    #         add_static_slice_layer = True
+
+    # check if two last parameters of node.inputs (axes, steps) if they exist are
+    # in input_tensors as only static inputs for these parameters are supported
+    last_params_static = (all(n in node.input_tensors for n in node.inputs[3:])
+                          if len(node.inputs) > 3 else True)
+    # check if first two parameters of node.inputs (starts, ends) are in input_tensors
+    # if so, can add with add_slice_static, else will need to use add_slice_dynamic
+    add_static_slice_layer = all(n in node.input_tensors for n in
+                                 node.inputs[1:min(3, len(node.inputs))])
+
+    if not last_params_static:
+        return err.unsupported_op_configuration(
+            builder,
+            node,
+            graph,
+            "CoreML does not support Dynamic Slice with unknown axes. Please provide Custom Function/Layer",
+        )
 
     if add_static_slice_layer:
         ip_starts = node.input_tensors[node.inputs[1]]
@@ -2362,11 +2396,71 @@ def _convert_slice(builder, node, graph, err):
             end_masks=end_masks,
         )
     else:
-        err.unsupported_op_configuration(
-            builder,
-            node,
-            graph,
-            "CoreML does not support Dynamic Slice with unknown axes. Please provide Custom Function/Layer",
+        axes = (
+            node.input_tensors[node.inputs[3]] if len(node.inputs) > 3 else default_axes
+        )
+        ip_steps = node.input_tensors[node.inputs[4]] if len(node.inputs) > 4 else None
+
+        # for ip_name in node.inputs:
+        #     print(f'%%% {ip_name}: {graph.shape_dict[ip_name]}')
+        # print(f'max in starts: {max(node.input_tensors[node.inputs[1]])}')
+        # print(f'starts shape: {node.input_tensors[node.inputs[1]].shape}')
+        # print(f'ends shape: {graph.shape_dict["/mask_gen/decoder/pos_enc_tgt/Unsqueeze_1_output_0"]}')
+        # print(f'axes: {axes}')
+
+        # check axes contains only one value (as only this config is supported right now)
+        if not len(axes) == 1:
+            err.unsupported_op_configuration(
+                builder,
+                node,
+                graph,
+                "CoreML does not support Dynamic slice with multiple axes",
+            )
+            return
+
+        # expand left and right around axis for both `start` (0) and `end` (-1)
+        if axes[0] >= 0:
+            lhs_pad_amount = axes[0]
+            rhs_pad_amount = len_of_data - axes[0] - 1
+        else:
+            lhs_pad_amount = len_of_data + axes[0]
+            rhs_pad_amount = -(axes[0] + 1)
+        
+        starts_name = node.inputs[1]
+        ends_name = node.inputs[2]
+        starts_name_pad_layer = f'{starts_name}_pad'
+        ends_name_pad_layer = f'{ends_name}_pad'
+        starts_name_pad = f'{starts_name_pad_layer}_output'
+        ends_name_pad = f'{ends_name_pad_layer}_output'
+        # print(f'$$$ new starts: {starts_name} -> {starts_name_pad}')
+        # print(f'$$$ new ends: {ends_name} -> {ends_name_pad}')
+        # don't add padded layers multiple times if input has been seen before
+        if not starts_name_pad_layer in builder.layer_specs:
+            assert ends_name_pad_layer not in builder.layer_specs
+            builder.add_constant_pad(
+                name=starts_name_pad_layer,
+                input_names=[],
+                output_name=starts_name_pad,
+                value=0,
+                pad_to_given_output_size_mode=False,
+                pad_amounts=[lhs_pad_amount, rhs_pad_amount]
+            )
+            builder.add_constant_pad(
+                name=ends_name_pad_layer,
+                input_names=[],
+                output_name=ends_name_pad,
+                value=-1,
+                pad_to_given_output_size_mode=False,
+                pad_amounts=[lhs_pad_amount, rhs_pad_amount]
+            )
+
+        slice_inputs = [node.inputs[0], starts_name_pad, ends_name_pad]
+
+        builder.add_slice_dynamic(
+            name=node.name,
+            input_names=slice_inputs,
+            output_name=node.outputs[0],
+            strides=ip_steps,
         )
 
 
@@ -2614,7 +2708,7 @@ def _convert_unsqueeze(builder, node, graph, err):
     convert to CoreML ExpandDim Layer:
     https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#L4810
     """
-    axes = node.attrs.get("axes")
+    axes = node.attrs.get("axes", [0])
     builder.add_expand_dims(
         name=node.name,
         input_name=node.inputs[0],
@@ -2631,6 +2725,38 @@ def _convert_where(builder, node, graph, err):
     load_input_constants(builder, node, graph, err)
     builder.add_where_broadcastable(
         name=node.name, input_names=node.inputs, output_name=node.outputs[0],
+    )
+
+
+def _convert_scatternd(
+    builder, node, graph, err
+):
+    # print(dir(node))
+    # print(node.name)
+    # print(list(node.attrs.keys()))
+    # print(list(node.inputs))
+    # # data [r], indices [q], updates [q + r - indices.shape[-1] - 1]
+    # raise RuntimeError()
+    # builder.add_scatter_nd(name, input_names, output_name)
+    # TODO: hopefully the ordering in add_scatter_nd matches
+    builder.add_scatter_nd(
+        name=node.name,
+        input_names=node.inputs,
+        output_name=node.outputs[0],
+    )
+
+def _convert_range(
+    builder, node, graph, err
+):
+    # print(dir(node))
+    # print(node.name)
+    # print(list(node.attrs.keys()))
+    # print(list(node.inputs))
+    # TODO: hopefully the ordering in add_range_dynamic matches
+    builder.add_range_dynamic(
+        name=node.name,
+        input_names=node.inputs,
+        output_name=node.outputs[0]
     )
 
 
@@ -2742,6 +2868,8 @@ _ONNX_NODE_REGISTRY_ND = {
     "Upsample": _convert_upsample,
     "Xor": _convert_logical,
     "Where": _convert_where,
+    "ScatterND": _convert_scatternd,
+    "Range": _convert_range,
 }
 
 

@@ -253,6 +253,7 @@ class Graph(object):
     @staticmethod
     def from_onnx(graph, onnx_ir_version):  # type: (GraphProto) -> Graph
         input_tensors = {t.name: numpy_helper.to_array(t) for t in graph.initializer}
+        # print(f'input_tensors = {list(input_tensors.keys())}')
         nodes_ = []
         nodes_by_input = {}  # type: Dict[Text, List[Node]]
         nodes_by_output = {}
@@ -301,13 +302,22 @@ class Graph(object):
                 [int(dim.dim_value) for dim in value_info.type.tensor_type.shape.dim]
             )
             if t:
+                # print(f'## Adding to shape_dict: {value_info.name}')
                 shape_dict[value_info.name] = t
 
+        print(f'## graph.value_info: {[n.name for n in graph.value_info]}')
+        print(f'## graph.input: {[n.name for n in graph.input]}')
         for value_info in graph.value_info:
             extract_value_info(shape_dict, value_info)
         for value_info in graph.input:
             extract_value_info(shape_dict, value_info)
         for value_info in graph.output:
             extract_value_info(shape_dict, value_info)
+
+        # add constant initializers to shape_dict
+        input_tensors_only = set(input_tensors.keys()) - set(shape_dict.keys())
+        for t_name in input_tensors_only:
+            t_ip = input_tensors[t_name]
+            shape_dict[t_name] = t_ip.shape
 
         return Graph(nodes_, inputs, outputs, shape_dict, onnx_ir_version)
